@@ -33,7 +33,7 @@ def init_db():
                         FOREIGN KEY (cnpj_fornecedor) REFERENCES fornecedores(cnpj),
                         FOREIGN KEY (id_produto_catalogo) REFERENCES produtos_catalogo(id))''')
     
-    # Histórico de Compras (Com REGRA ÚNICA para evitar duplicatas ao navegar)
+    # Histórico de Compras
     cursor.execute('''CREATE TABLE IF NOT EXISTS compras (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         numero_nfe TEXT,
@@ -81,7 +81,7 @@ def processar_nfe(xml_file):
     emit = infNfe.find(f'{prefix}emit', ns) if ns else infNfe.find('emit')
     
     nNF = get_xml_text(ide, f'{prefix}nNF', ns, "000")
-    dhEmi = get_xml_text(ide, f'{prefix}dhEmi', ns, get_xml_text(ide, f'{prefix}dEmi', ns, "2026-01-01"))[:10]
+    dhEmi = get_xml_text(ide, f'{prefix}dhEmi', ns, get_xml_text(ide, f'{prefix}dEmi', ns, "2026-08-01"))[:10]
     
     cnpj_emit = get_xml_text(emit, f'{prefix}CNPJ', ns, "00000000000000")
     xNome_emit = get_xml_text(emit, f'{prefix}xNome', ns, "Fornecedor Desconhecido")
@@ -103,8 +103,14 @@ def processar_nfe(xml_file):
         try: vUnCom = float(get_xml_text(prod, f'{prefix}vUnCom', ns, "0"))
         except ValueError: vUnCom = 0.0
             
-        try: vProd = float(get_xml_text(prod, f'{prefix}vProd', ns, "0"))
-        except ValueError: vProd = 0.0
+        # Extrai valor total ou calcula automaticamente (Quantidade * Valor Unitário)
+        try:
+            vProd_str = get_xml_text(prod, f'{prefix}vProd', ns, "0")
+            vProd = float(vProd_str)
+            if vProd == 0 and (qCom * vUnCom) > 0:
+                vProd = round(qCom * vUnCom, 2)
+        except ValueError:
+            vProd = round(qCom * vUnCom, 2)
         
         cursor.execute("INSERT OR IGNORE INTO produtos_catalogo (nome_padronizado) VALUES (?)", (xProd,))
         cursor.execute("SELECT id FROM produtos_catalogo WHERE nome_padronizado = ?", (xProd,))
@@ -114,7 +120,6 @@ def processar_nfe(xml_file):
         cursor.execute("INSERT OR IGNORE INTO de_para (cnpj_fornecedor, nome_produto_fornecedor, id_produto_catalogo) VALUES (?, ?, ?)",
                        (cnpj_emit, xProd, id_catalogo))
         
-        # O 'INSERT OR IGNORE' impede a duplicação de itens da mesma nota fiscal
         cursor.execute('''INSERT OR IGNORE INTO compras 
                           (numero_nfe, data_emissao, cnpj_fornecedor, nome_produto_fornecedor, id_produto_catalogo, quantidade, valor_unitario, valor_total)
                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
@@ -177,19 +182,33 @@ finally:
     conn.close()
 
 if not df_compras.empty:
-    st.subheader("📊 Análise de Histórico de Preços")
     
-    produtos = df_compras['produto'].unique()
-    produto_sel = st.selectbox("Selecione um produto para analisar:", produtos)
+    # --- PAINEL DE GRÁFICOS ---
+    st.subheader("📊 Análise de Compras")
     
-    df_prod = df_compras[df_compras['produto'] == produto_sel].sort_values('data_emissao')
+    col1, col2 = st.columns(2)
     
-    fig = px.line(df_prod, x='data_emissao', y='valor_unitario', color='fornecedor',
-                  markers=True, title=f"Variação de Preço: {produto_sel}",
-                  labels={'data_emissao': 'Data de Emissão', 'valor_unitario': 'R$ Valor Unitário'})
-    st.plotly_chart(fig, use_container_width=True)
-    
+    with col1:
+        produtos = df_compras['produto'].unique()
+        produto_sel = st.selectbox("Selecione um produto para variação de preço:", produtos)
+        df_prod = df_compras[df_compras['produto'] == produto_sel].sort_values('data_emissao')
+        
+        fig_linha = px.line(df_prod, x='data_emissao', y='valor_unitario', color='fornecedor',
+                            markers=True, title=f"Variação de Preço: {produto_sel}",
+                            labels={'data_emissao': 'Data', 'valor_unitario': 'R$ Unitário'})
+        st.plotly_chart(fig_linha, use_container_width=True)
+        
+    with col2:
+        # Gráfico de Pizza - Distribuição dos Gastos por Produto
+        df_pizza = df_compras.groupby('produto')['valor_total'].sum().reset_index()
+        fig_pizza = px.pie(df_pizza, values='valor_total', names='produto', 
+                           title="Distribuição do Gasto Total por Produto (R$)",
+                           hole=0.3) # Layout em rosca/pizza
+        st.plotly_chart(fig_pizza, use_container_width=True)
+
+    # --- TABELA DE DADOS ---
     st.subheader("📋 Todas as Compras Registradas")
     st.dataframe(df_compras, use_container_width=True)
+
 else:
     st.info("Nenhuma nota fiscal cadastrada ainda. Use a barra lateral para importar o primeiro arquivo XML!")
