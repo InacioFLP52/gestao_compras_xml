@@ -105,7 +105,7 @@ if st.sidebar.button("🗑️ Zerar Banco de Dados", type="primary"):
 
 
 # --- CORPO PRINCIPAL DO APP ---
-st.title("📦 Sistema Inteligente de Gestão de Compras")
+st.title("📦 Sistema de Gestão de Compras")
 
 # Carregar dados do banco
 conn = sqlite3.connect(DB_NAME)
