@@ -3,7 +3,6 @@ import pandas as pd
 import sqlite3
 import xml.etree.ElementTree as ET
 import plotly.express as px
-import os
 
 # ==========================================
 # 1. CONFIGURAÇÃO E BANCO DE DADOS (SQLite)
@@ -15,17 +14,17 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # Tabela 1: Cadastro único de fornecedores (por CNPJ)
+    # Fornecedores
     cursor.execute('''CREATE TABLE IF NOT EXISTS fornecedores (
                         cnpj TEXT PRIMARY KEY,
                         nome TEXT)''')
     
-    # Tabela 2: Seu catálogo mestre de produtos
+    # Catálogo de Produtos
     cursor.execute('''CREATE TABLE IF NOT EXISTS produtos_catalogo (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         nome_padronizado TEXT UNIQUE)''')
     
-    # Tabela 3: De-Para (Mapeia o nome do produto no fornecedor para o seu catálogo)
+    # De-Para
     cursor.execute('''CREATE TABLE IF NOT EXISTS de_para (
                         cnpj_fornecedor TEXT,
                         nome_produto_fornecedor TEXT,
@@ -34,7 +33,7 @@ def init_db():
                         FOREIGN KEY (cnpj_fornecedor) REFERENCES fornecedores(cnpj),
                         FOREIGN KEY (id_produto_catalogo) REFERENCES produtos_catalogo(id))''')
     
-    # Tabela 4: Histórico de Compras (Itens das notas fiscais)
+    # Histórico de Compras (Com REGRA ÚNICA para evitar duplicatas ao navegar)
     cursor.execute('''CREATE TABLE IF NOT EXISTS compras (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         numero_nfe TEXT,
@@ -45,6 +44,7 @@ def init_db():
                         quantidade REAL,
                         valor_unitario REAL,
                         valor_total REAL,
+                        UNIQUE(numero_nfe, cnpj_fornecedor, nome_produto_fornecedor, quantidade, valor_total),
                         FOREIGN KEY (cnpj_fornecedor) REFERENCES fornecedores(cnpj),
                         FOREIGN KEY (id_produto_catalogo) REFERENCES produtos_catalogo(id))''')
     
@@ -70,11 +70,9 @@ def processar_nfe(xml_file):
     tree = ET.parse(xml_file)
     root = tree.getroot()
     
-    # Trata Namespace do XML da NF-e se existir
     ns = {'nfe': root.tag.split('}')[0].strip('{')} if '}' in root.tag else {}
     prefix = 'nfe:' if ns else ''
     
-    # Dados da Nota
     infNfe = root.find(f'.//{prefix}infNFe', ns) if ns else root.find('.//infNFe')
     if infNfe is None:
         infNfe = root
@@ -82,17 +80,14 @@ def processar_nfe(xml_file):
     ide = infNfe.find(f'{prefix}ide', ns) if ns else infNfe.find('ide')
     emit = infNfe.find(f'{prefix}emit', ns) if ns else infNfe.find('emit')
     
-    # Extrai dados básicos com fallback seguro
     nNF = get_xml_text(ide, f'{prefix}nNF', ns, "000")
     dhEmi = get_xml_text(ide, f'{prefix}dhEmi', ns, get_xml_text(ide, f'{prefix}dEmi', ns, "2026-01-01"))[:10]
     
     cnpj_emit = get_xml_text(emit, f'{prefix}CNPJ', ns, "00000000000000")
     xNome_emit = get_xml_text(emit, f'{prefix}xNome', ns, "Fornecedor Desconhecido")
     
-    # 1. Cadastra/Atualiza Fornecedor
     cursor.execute("INSERT OR IGNORE INTO fornecedores (cnpj, nome) VALUES (?, ?)", (cnpj_emit, xNome_emit))
     
-    # 2. Processa os Itens (Produtos)
     det_list = infNfe.findall(f'{prefix}det', ns) if ns else infNfe.findall('det')
     
     for det in det_list:
@@ -102,33 +97,25 @@ def processar_nfe(xml_file):
             
         xProd = get_xml_text(prod, f'{prefix}xProd', ns, "Produto sem nome")
         
-        try:
-            qCom = float(get_xml_text(prod, f'{prefix}qCom', ns, "1"))
-        except ValueError:
-            qCom = 1.0
+        try: qCom = float(get_xml_text(prod, f'{prefix}qCom', ns, "1"))
+        except ValueError: qCom = 1.0
             
-        try:
-            vUnCom = float(get_xml_text(prod, f'{prefix}vUnCom', ns, "0"))
-        except ValueError:
-            vUnCom = 0.0
+        try: vUnCom = float(get_xml_text(prod, f'{prefix}vUnCom', ns, "0"))
+        except ValueError: vUnCom = 0.0
             
-        try:
-            vProd = float(get_xml_text(prod, f'{prefix}vProd', ns, "0"))
-        except ValueError:
-            vProd = 0.0
+        try: vProd = float(get_xml_text(prod, f'{prefix}vProd', ns, "0"))
+        except ValueError: vProd = 0.0
         
-        # Cria/Busca produto no catálogo padronizado
         cursor.execute("INSERT OR IGNORE INTO produtos_catalogo (nome_padronizado) VALUES (?)", (xProd,))
         cursor.execute("SELECT id FROM produtos_catalogo WHERE nome_padronizado = ?", (xProd,))
         res = cursor.fetchone()
         id_catalogo = res[0] if res else 1
         
-        # Registra no De-Para
         cursor.execute("INSERT OR IGNORE INTO de_para (cnpj_fornecedor, nome_produto_fornecedor, id_produto_catalogo) VALUES (?, ?, ?)",
                        (cnpj_emit, xProd, id_catalogo))
         
-        # Insere na tabela de Compras
-        cursor.execute('''INSERT INTO compras 
+        # O 'INSERT OR IGNORE' impede a duplicação de itens da mesma nota fiscal
+        cursor.execute('''INSERT OR IGNORE INTO compras 
                           (numero_nfe, data_emissao, cnpj_fornecedor, nome_produto_fornecedor, id_produto_catalogo, quantidade, valor_unitario, valor_total)
                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                        (nNF, dhEmi, cnpj_emit, xProd, id_catalogo, qCom, vUnCom, vProd))
@@ -142,7 +129,7 @@ def processar_nfe(xml_file):
 
 st.set_page_config(page_title="Gestão de Compras NF-e", layout="wide")
 
-# Barra Lateral - Upload de XML
+# Barra Lateral - Upload
 st.sidebar.title("Importar Nota")
 uploaded_file = st.sidebar.file_uploader("Arraste o XML da NF-e aqui", type=["xml"])
 
@@ -157,8 +144,7 @@ if uploaded_file is not None:
 st.sidebar.markdown("---")
 st.sidebar.title("⚙️ Configurações")
 
-# BOTÃO DE REINICIALIZAÇÃO FORÇADA DO BANCO DE DADOS
-if st.sidebar.button("🗑️ Zerar e Recriar Banco", type="primary"):
+if st.sidebar.button("🗑️ Zerar Banco de Dados", type="primary"):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("DROP TABLE IF EXISTS compras")
@@ -168,9 +154,8 @@ if st.sidebar.button("🗑️ Zerar e Recriar Banco", type="primary"):
     conn.commit()
     conn.close()
     
-    # Recria as tabelas do zero com a nova estrutura
     init_db()
-    st.sidebar.warning("Banco de dados recriado do zero com sucesso!")
+    st.sidebar.warning("Banco de dados resetado com sucesso!")
     st.rerun()
 
 # Conteúdo Principal
