@@ -103,7 +103,6 @@ def processar_nfe(xml_file):
         try: vUnCom = float(get_xml_text(prod, f'{prefix}vUnCom', ns, "0"))
         except ValueError: vUnCom = 0.0
             
-        # Extrai valor total ou calcula automaticamente (Quantidade * Valor Unitário)
         try:
             vProd_str = get_xml_text(prod, f'{prefix}vProd', ns, "0")
             vProd = float(vProd_str)
@@ -183,32 +182,78 @@ finally:
 
 if not df_compras.empty:
     
-    # --- PAINEL DE GRÁFICOS ---
-    st.subheader("📊 Análise de Compras")
+    # Converte coluna de data para o formato datetime
+    df_compras['data_emissao_dt'] = pd.to_datetime(df_compras['data_emissao'])
     
-    col1, col2 = st.columns(2)
+    # --- PAINEL DE BUSCA E FILTROS ---
+    st.markdown("### 🔍 Busca e Filtros Avançados")
     
-    with col1:
-        produtos = df_compras['produto'].unique()
-        produto_sel = st.selectbox("Selecione um produto para variação de preço:", produtos)
-        df_prod = df_compras[df_compras['produto'] == produto_sel].sort_values('data_emissao')
+    f_col1, f_col2, f_col3 = st.columns(3)
+    
+    with f_col1:
+        # Filtro por Fornecedor (Empresa)
+        lista_fornecedores = ["Todos"] + list(df_compras['fornecedor'].unique())
+        fornecedor_sel = st.selectbox("Empresa / Fornecedor:", lista_fornecedores)
         
-        fig_linha = px.line(df_prod, x='data_emissao', y='valor_unitario', color='fornecedor',
-                            markers=True, title=f"Variação de Preço: {produto_sel}",
-                            labels={'data_emissao': 'Data', 'valor_unitario': 'R$ Unitário'})
-        st.plotly_chart(fig_linha, use_container_width=True)
+    with f_col2:
+        # Filtro por Busca do Nome do Produto
+        busca_produto = st.text_input("Buscar Produto (digite o nome):", "")
         
-    with col2:
-        # Gráfico de Pizza - Distribuição dos Gastos por Produto
-        df_pizza = df_compras.groupby('produto')['valor_total'].sum().reset_index()
-        fig_pizza = px.pie(df_pizza, values='valor_total', names='produto', 
-                           title="Distribuição do Gasto Total por Produto (R$)",
-                           hole=0.3) # Layout em rosca/pizza
-        st.plotly_chart(fig_pizza, use_container_width=True)
+    with f_col3:
+        # Filtro por Intervalo de Datas
+        min_date = df_compras['data_emissao_dt'].min().date()
+        max_date = df_compras['data_emissao_dt'].max().date()
+        datas_sel = st.date_input("Período da Compra:", value=(min_date, max_date))
 
-    # --- TABELA DE DADOS ---
-    st.subheader("📋 Todas as Compras Registradas")
-    st.dataframe(df_compras, use_container_width=True)
+    # --- APLICAÇÃO DOS FILTROS ---
+    df_filtrado = df_compras.copy()
+
+    # 1. Aplica filtro de Empresa
+    if fornecedor_sel != "Todos":
+        df_filtrado = df_filtrado[df_filtrado['fornecedor'] == fornecedor_sel]
+
+    # 2. Aplica filtro de Produto
+    if busca_produto.strip() != "":
+        df_filtrado = df_filtrado[df_filtrado['produto'].str.contains(busca_produto, case=False, na=False)]
+
+    # 3. Aplica filtro de Data (garante intervalo completo)
+    if isinstance(datas_sel, tuple) and len(datas_sel) == 2:
+        dt_inicio, dt_fim = datas_sel
+        df_filtrado = df_filtrado[(df_filtrado['data_emissao_dt'].dt.date >= dt_inicio) & 
+                                  (df_filtrado['data_emissao_dt'].dt.date <= dt_fim)]
+
+    st.markdown("---")
+
+    if not df_filtrado.empty:
+        # --- PAINEL DE GRÁFICOS ---
+        st.subheader("📊 Análise de Compras (Filtrado)")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            produtos_disponiveis = df_filtrado['produto'].unique()
+            prod_grafico = st.selectbox("Selecione o produto para a linha de tempo:", produtos_disponiveis)
+            df_prod = df_filtrado[df_filtrado['produto'] == prod_grafico].sort_values('data_emissao')
+            
+            fig_linha = px.line(df_prod, x='data_emissao', y='valor_unitario', color='fornecedor',
+                                markers=True, title=f"Variação de Preço: {prod_grafico}",
+                                labels={'data_emissao': 'Data', 'valor_unitario': 'R$ Unitário'})
+            st.plotly_chart(fig_linha, use_container_width=True)
+            
+        with col2:
+            df_pizza = df_filtrado.groupby('produto')['valor_total'].sum().reset_index()
+            fig_pizza = px.pie(df_pizza, values='valor_total', names='produto', 
+                               title="Distribuição do Gasto Total por Produto (R$)",
+                               hole=0.3)
+            st.plotly_chart(fig_pizza, use_container_width=True)
+
+        # --- TABELA DE DADOS ---
+        st.subheader(f"📋 Compras Encontradas ({len(df_filtrado)} registros)")
+        # Remove a coluna temporária usada pra cálculo de data
+        df_exibicao = df_filtrado.drop(columns=['data_emissao_dt'])
+        st.dataframe(df_exibicao, use_container_width=True)
+    else:
+        st.warning("Nenhuma compra encontrada com os filtros selecionados.")
 
 else:
     st.info("Nenhuma nota fiscal cadastrada ainda. Use a barra lateral para importar o primeiro arquivo XML!")
