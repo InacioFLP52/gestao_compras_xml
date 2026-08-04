@@ -3,13 +3,16 @@ import pandas as pd
 import sqlite3
 import xml.etree.ElementTree as ET
 import plotly.express as px
+import os
 
 # ==========================================
 # 1. CONFIGURAÇÃO E BANCO DE DADOS (SQLite)
 # ==========================================
 
+DB_FILE = 'compras_inteligentes.db'
+
 def init_db():
-    conn = sqlite3.connect('compras_inteligentes.db')
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
     # Tabela 1: Cadastro único de fornecedores (por CNPJ)
@@ -52,6 +55,8 @@ init_db()
 
 # Função auxiliar para extrair texto de tag com segurança
 def get_xml_text(element, path, ns, default=""):
+    if element is None:
+        return default
     node = element.find(path, ns) if ns else element.find(path)
     if node is not None and node.text is not None:
         return node.text.strip()
@@ -59,7 +64,7 @@ def get_xml_text(element, path, ns, default=""):
 
 # Função para processar e salvar a NF-e no SQLite
 def processar_nfe(xml_file):
-    conn = sqlite3.connect('compras_inteligentes.db')
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
     tree = ET.parse(xml_file)
@@ -96,14 +101,27 @@ def processar_nfe(xml_file):
             continue
             
         xProd = get_xml_text(prod, f'{prefix}xProd', ns, "Produto sem nome")
-        qCom = float(get_xml_text(prod, f'{prefix}qCom', ns, "1"))
-        vUnCom = float(get_xml_text(prod, f'{prefix}vUnCom', ns, "0"))
-        vProd = float(get_xml_text(prod, f'{prefix}vProd', ns, "0"))
+        
+        try:
+            qCom = float(get_xml_text(prod, f'{prefix}qCom', ns, "1"))
+        except ValueError:
+            qCom = 1.0
+            
+        try:
+            vUnCom = float(get_xml_text(prod, f'{prefix}vUnCom', ns, "0"))
+        except ValueError:
+            vUnCom = 0.0
+            
+        try:
+            vProd = float(get_xml_text(prod, f'{prefix}vProd', ns, "0"))
+        except ValueError:
+            vProd = 0.0
         
         # Cria/Busca produto no catálogo padronizado
         cursor.execute("INSERT OR IGNORE INTO produtos_catalogo (nome_padronizado) VALUES (?)", (xProd,))
         cursor.execute("SELECT id FROM produtos_catalogo WHERE nome_padronizado = ?", (xProd,))
-        id_catalogo = cursor.fetchone()[0]
+        res = cursor.fetchone()
+        id_catalogo = res[0] if res else 1
         
         # Registra no De-Para
         cursor.execute("INSERT OR IGNORE INTO de_para (cnpj_fornecedor, nome_produto_fornecedor, id_produto_catalogo) VALUES (?, ?, ?)",
@@ -138,31 +156,40 @@ if uploaded_file is not None:
 # Barra Lateral - Configurações
 st.sidebar.markdown("---")
 st.sidebar.title("⚙️ Configurações")
-if st.sidebar.button("🗑️ Zerar Banco de Dados", type="primary"):
-    conn = sqlite3.connect('compras_inteligentes.db')
+
+# BOTÃO DE REINICIALIZAÇÃO FORÇADA DO BANCO DE DADOS
+if st.sidebar.button("🗑️ Zerar e Recriar Banco", type="primary"):
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM compras")
-    cursor.execute("DELETE FROM de_para")
-    cursor.execute("DELETE FROM fornecedores")
-    cursor.execute("DELETE FROM produtos_catalogo")
+    cursor.execute("DROP TABLE IF EXISTS compras")
+    cursor.execute("DROP TABLE IF EXISTS de_para")
+    cursor.execute("DROP TABLE IF EXISTS fornecedores")
+    cursor.execute("DROP TABLE IF EXISTS produtos_catalogo")
     conn.commit()
     conn.close()
-    st.sidebar.warning("Banco de dados zerado com sucesso!")
+    
+    # Recria as tabelas do zero com a nova estrutura
+    init_db()
+    st.sidebar.warning("Banco de dados recriado do zero com sucesso!")
     st.rerun()
 
 # Conteúdo Principal
 st.title("📦 Sistema de Gestão de Compras")
 
-conn = sqlite3.connect('compras_inteligentes.db')
-df_compras = pd.read_sql_query('''
-    SELECT c.id, c.numero_nfe, c.data_emissao, f.nome as fornecedor, 
-           p.nome_padronizado as produto, c.quantidade, c.valor_unitario, c.valor_total
-    FROM compras c
-    JOIN fornecedores f ON c.cnpj_fornecedor = f.cnpj
-    JOIN produtos_catalogo p ON c.id_produto_catalogo = p.id
-    ORDER BY c.data_emissao DESC
-''', conn)
-conn.close()
+conn = sqlite3.connect(DB_FILE)
+try:
+    df_compras = pd.read_sql_query('''
+        SELECT c.id, c.numero_nfe, c.data_emissao, f.nome as fornecedor, 
+               p.nome_padronizado as produto, c.quantidade, c.valor_unitario, c.valor_total
+        FROM compras c
+        JOIN fornecedores f ON c.cnpj_fornecedor = f.cnpj
+        JOIN produtos_catalogo p ON c.id_produto_catalogo = p.id
+        ORDER BY c.data_emissao DESC
+    ''', conn)
+except Exception:
+    df_compras = pd.DataFrame()
+finally:
+    conn.close()
 
 if not df_compras.empty:
     st.subheader("📊 Análise de Histórico de Preços")
