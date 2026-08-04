@@ -1,145 +1,183 @@
+import streamlit as st
+import pandas as pd
 import sqlite3
 import xml.etree.ElementTree as ET
-import pandas as pd
 import plotly.express as px
-import streamlit as st
 
-# Configuração da página
-st.set_page_config(page_title="Gestão de Compras NF-e", layout="wide")
-
-# Conexão com o banco de dados SQLite
-DB_NAME = "compras_inteligentes.db"
-
+# ==========================================
+# 1. CONFIGURAÇÃO E BANCO DE DADOS (SQLite)
+# ==========================================
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect('compras_inteligentes.db')
     cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS compras (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fornecedor TEXT,
-            data TEXT,
-            produto TEXT,
-            quantidade REAL,
-            valor_unit REAL,
-            valor_total REAL
-        )
-    """)
+    
+    # Tabela 1: Cadastro único de fornecedores (por CNPJ)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS fornecedores (
+                        cnpj TEXT PRIMARY KEY,
+                        nome TEXT)''')
+    
+    # Tabela 2: Seu catálogo mestre de produtos
+    cursor.execute('''CREATE TABLE IF NOT EXISTS produtos_catalogo (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        nome_padronizado TEXT UNIQUE)''')
+    
+    # Tabela 3: De-Para (Mapeia o nome do produto no fornecedor para o seu catálogo)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS de_para (
+                        cnpj_fornecedor TEXT,
+                        nome_produto_fornecedor TEXT,
+                        id_produto_catalogo INTEGER,
+                        PRIMARY KEY (cnpj_fornecedor, nome_produto_fornecedor),
+                        FOREIGN KEY (cnpj_fornecedor) REFERENCES fornecedores(cnpj),
+                        FOREIGN KEY (id_produto_catalogo) REFERENCES produtos_catalogo(id))''')
+    
+    # Tabela 4: Histórico de Compras (Itens das notas fiscais)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS compras (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        numero_nfe TEXT,
+                        data_emissao DATE,
+                        cnpj_fornecedor TEXT,
+                        nome_produto_fornecedor TEXT,
+                        id_produto_catalogo INTEGER,
+                        quantidade REAL,
+                        valor_unitario REAL,
+                        valor_total REAL,
+                        FOREIGN KEY (cnpj_fornecedor) REFERENCES fornecedores(cnpj),
+                        FOREIGN KEY (id_produto_catalogo) REFERENCES produtos_catalogo(id))''')
+    
     conn.commit()
     conn.close()
 
-
-# Inicializa o banco de dados se não existir
 init_db()
 
+# Função auxiliar para extrair texto de tag com segurança
+def get_xml_text(element, path, ns, default=""):
+    node = element.find(path, ns) if ns else element.find(path)
+    if node is not None and node.text is not None:
+        return node.text.strip()
+    return default
 
-def processar_xml(xml_file):
-    try:
-        tree = ET.parse(xml_file)
-        root = tree.getroot()
-
-        # Namespace do XML da NF-e
-        ns = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
-
-        # Identificação do fornecedor e data
-        emitente = root.find(".//nfe:emit/nfe:xNome", ns)
-        fornecedor = emitente.text if emitente is not None else "Desconhecido"
-
-        dhEmi = root.find(".//nfe:ide/nfe:dhEmi", ns)
-        if dhEmi is not None:
-            data = dhEmi.text[:10]
-        else:
-            dEmi = root.find(".//nfe:ide/dEmi", ns)
-            data = dEmi.text[:10] if dEmi is not None else "2026-01-01"
-
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-
-        # Leitura dos itens da nota
-        for det in root.findall(".//nfe:det", ns):
-            prod = det.find("nfe:prod", ns)
-            produto = prod.find("nfe:xProd", ns).text
-            qCom = float(prod.find("nfe:qCom", ns).text)
-            vUnCom = float(prod.find("nfe:vUnCom", ns).text)
-            vProd = float(prod.find("nfe:vProd", ns).text)
-
-            cursor.execute(
-                """
-                INSERT INTO compras (fornecedor, data, produto, quantidade, valor_unit, valor_total)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """,
-                (fornecedor, data, produto, qCom, vUnCom, vProd),
-            )
-
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        st.error(f"Erro ao processar o arquivo XML: {e}")
-        return False
-
-
-# --- BARRA LATERAL (SIDEBAR) ---
-st.sidebar.title("Importar Nota")
-uploaded_file = st.sidebar.file_uploader(
-    "Arraste o XML da NF-e aqui", type=["xml"]
-)
-
-if uploaded_file is not None:
-    if processar_xml(uploaded_file):
-        st.sidebar.success("Nota importada com sucesso!")
-        st.rerun()
-
-# --- NOVO BOTÃO: ZERAR BANCO DE DADOS ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("⚙️ Configurações")
-
-if st.sidebar.button("🗑️ Zerar Banco de Dados", type="primary"):
-    conn = sqlite3.connect(DB_NAME)
+# Função para processar e salvar a NF-e no SQLite
+def processar_nfe(xml_file):
+    conn = sqlite3.connect('compras_inteligentes.db')
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM compras")
+    
+    tree = ET.parse(xml_file)
+    root = tree.getroot()
+    
+    # Trata Namespace do XML da NF-e se existir
+    ns = {'nfe': root.tag.split('}')[0].strip('{')} if '}' in root.tag else {}
+    prefix = 'nfe:' if ns else ''
+    
+    # Dados da Nota
+    infNfe = root.find(f'.//{prefix}infNFe', ns) if ns else root.find('.//infNFe')
+    if infNfe is None:
+        infNfe = root
+
+    ide = infNfe.find(f'{prefix}ide', ns) if ns else infNfe.find('ide')
+    emit = infNfe.find(f'{prefix}emit', ns) if ns else infNfe.find('emit')
+    
+    # Extrai dados básicos com fallback seguro
+    nNF = get_xml_text(ide, f'{prefix}nNF', ns, "000")
+    dhEmi = get_xml_text(ide, f'{prefix}dhEmi', ns, get_xml_text(ide, f'{prefix}dEmi', ns, "2026-01-01"))[:10]
+    
+    cnpj_emit = get_xml_text(emit, f'{prefix}CNPJ', ns, "00000000000000")
+    xNome_emit = get_xml_text(emit, f'{prefix}xNome', ns, "Fornecedor Desconhecido")
+    
+    # 1. Cadastra/Atualiza Fornecedor
+    cursor.execute("INSERT OR IGNORE INTO fornecedores (cnpj, nome) VALUES (?, ?)", (cnpj_emit, xNome_emit))
+    
+    # 2. Processa os Itens (Produtos)
+    det_list = infNfe.findall(f'{prefix}det', ns) if ns else infNfe.findall('det')
+    
+    for det in det_list:
+        prod = det.find(f'{prefix}prod', ns) if ns else det.find('prod')
+        if prod is None:
+            continue
+            
+        xProd = get_xml_text(prod, f'{prefix}xProd', ns, "Produto sem nome")
+        qCom = float(get_xml_text(prod, f'{prefix}qCom', ns, "1"))
+        vUnCom = float(get_xml_text(prod, f'{prefix}vUnCom', ns, "0"))
+        vProd = float(get_xml_text(prod, f'{prefix}vProd', ns, "0"))
+        
+        # Cria/Busca produto no catálogo padronizado
+        cursor.execute("INSERT OR IGNORE INTO produtos_catalogo (nome_padronizado) VALUES (?)", (xProd,))
+        cursor.execute("SELECT id FROM produtos_catalogo WHERE nome_padronizado = ?", (xProd,))
+        id_catalogo = cursor.fetchone()[0]
+        
+        # Registra no De-Para
+        cursor.execute("INSERT OR IGNORE INTO de_para (cnpj_fornecedor, nome_produto_fornecedor, id_produto_catalogo) VALUES (?, ?, ?)",
+                       (cnpj_emit, xProd, id_catalogo))
+        
+        # Insere na tabela de Compras
+        cursor.execute('''INSERT INTO compras 
+                          (numero_nfe, data_emissao, cnpj_fornecedor, nome_produto_fornecedor, id_produto_catalogo, quantidade, valor_unitario, valor_total)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                       (nNF, dhEmi, cnpj_emit, xProd, id_catalogo, qCom, vUnCom, vProd))
+        
     conn.commit()
     conn.close()
-    st.sidebar.success("Banco de dados limpo com sucesso!")
+
+# ==========================================
+# 2. INTERFACE GRÁFICA (Streamlit)
+# ==========================================
+
+st.set_page_config(page_title="Gestão de Compras NF-e", layout="wide")
+
+# Barra Lateral - Upload de XML
+st.sidebar.title("Importar Nota")
+uploaded_file = st.sidebar.file_uploader("Arraste o XML da NF-e aqui", type=["xml"])
+
+if uploaded_file is not None:
+    try:
+        processar_nfe(uploaded_file)
+        st.sidebar.success("NF-e processada com sucesso!")
+    except Exception as e:
+        st.sidebar.error(f"Erro ao processar o arquivo XML: {e}")
+
+# Barra Lateral - Configurações
+st.sidebar.markdown("---")
+st.sidebar.title("⚙️ Configurações")
+if st.sidebar.button("🗑️ Zerar Banco de Dados", type="primary"):
+    conn = sqlite3.connect('compras_inteligentes.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM compras")
+    cursor.execute("DELETE FROM de_para")
+    cursor.execute("DELETE FROM fornecedores")
+    cursor.execute("DELETE FROM produtos_catalogo")
+    conn.commit()
+    conn.close()
+    st.sidebar.warning("Banco de dados zerado com sucesso!")
     st.rerun()
 
-
-# --- CORPO PRINCIPAL DO APP ---
+# Conteúdo Principal
 st.title("📦 Sistema de Gestão de Compras")
 
-# Carregar dados do banco
-conn = sqlite3.connect(DB_NAME)
-df = pd.read_sql_query("SELECT * FROM compras", conn)
+conn = sqlite3.connect('compras_inteligentes.db')
+df_compras = pd.read_sql_query('''
+    SELECT c.id, c.numero_nfe, c.data_emissao, f.nome as fornecedor, 
+           p.nome_padronizado as produto, c.quantidade, c.valor_unitario, c.valor_total
+    FROM compras c
+    JOIN fornecedores f ON c.cnpj_fornecedor = f.cnpj
+    JOIN produtos_catalogo p ON c.id_produto_catalogo = p.id
+    ORDER BY c.data_emissao DESC
+''', conn)
 conn.close()
 
-if not df.empty:
-    st.header("📊 Análise de Preços Históricos")
-
-    produtos = df["produto"].unique()
-    produto_selecionado = st.selectbox(
-        "Selecione o produto para análise:", produtos
-    )
-
-    df_prod = df[df["produto"] == produto_selecionado].sort_values("data")
-
-    fig = px.line(
-        df_prod,
-        x="data",
-        y="valor_unit",
-        color="fornecedor",
-        markers=True,
-        title=f"Evolução de Preço Unitário: {produto_selecionado}",
-        labels={
-            "data": "Data",
-            "valor_unit": "Valor Unitário (R$)",
-            "fornecedor": "Fornecedor",
-        },
-    )
+if not df_compras.empty:
+    st.subheader("📊 Análise de Histórico de Preços")
+    
+    produtos = df_compras['produto'].unique()
+    produto_sel = st.selectbox("Selecione um produto para analisar:", produtos)
+    
+    df_prod = df_compras[df_compras['produto'] == produto_sel].sort_values('data_emissao')
+    
+    fig = px.line(df_prod, x='data_emissao', y='valor_unitario', color='fornecedor',
+                  markers=True, title=f"Variação de Preço: {produto_sel}",
+                  labels={'data_emissao': 'Data de Emissão', 'valor_unitario': 'R$ Valor Unitário'})
     st.plotly_chart(fig, use_container_width=True)
-
-    st.header("Últimas Entradas")
-    st.dataframe(df, use_container_width=True)
+    
+    st.subheader("📋 Todas as Compras Registradas")
+    st.dataframe(df_compras, use_container_width=True)
 else:
-    st.info(
-        "Nenhuma nota fiscal cadastrada ainda. Use a barra lateral para importar o primeiro arquivo XML!"
-    )
+    st.info("Nenhuma nota fiscal cadastrada ainda. Use a barra lateral para importar o primeiro arquivo XML!")
